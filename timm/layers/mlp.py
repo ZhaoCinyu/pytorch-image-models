@@ -5,7 +5,7 @@ Hacked together by / Copyright 2020 Ross Wightman
 from functools import partial
 
 from torch import nn as nn
-
+import torch
 from .grn import GlobalResponseNorm
 from .helpers import to_2tuple
 
@@ -258,3 +258,104 @@ class GlobalResponseNormMlp(nn.Module):
         x = self.fc2(x)
         x = self.drop2(x)
         return x
+
+class ConvMlpExpert(nn.Module):
+    def __init__(
+            self,
+            in_features,
+            hidden_features=None,
+            out_features=None,
+            act_layer=nn.ReLU,
+            norm_layer=None,
+            bias=True,
+            drop=0.,
+            expert_scale=4,  # number of experts
+    ):
+        super().__init__()
+        out_features = out_features or in_features
+        hidden_features = hidden_features or in_features
+        
+        hidden_features = hidden_features // expert_scale
+        bias = to_2tuple(bias)
+
+        self.fc1 = nn.Conv2d(in_features, hidden_features, kernel_size=1, bias=bias[0])
+        self.norm = norm_layer(hidden_features) if norm_layer else nn.Identity()
+        self.act = act_layer()
+        self.drop = nn.Dropout(drop)
+        self.fc2 = nn.Conv2d(hidden_features, out_features, kernel_size=1, bias=bias[1])
+
+    def forward(self, x):
+        x = self.fc1(x)
+        x = self.norm(x)
+        x = self.act(x)
+        x = self.drop(x)
+        x = self.fc2(x)
+        return x
+    
+class ConvMoE(nn.Module):
+    def __init__(
+            self,
+            in_features,
+            hidden_features=None,
+            out_features=None,
+            act_layer=nn.ReLU,
+            norm_layer=None,
+            bias=True,
+            drop=0.,
+            num_experts=4,
+            top_k=2,
+    ):
+        super().__init__()
+        out_features = out_features or in_features
+        hidden_features = hidden_features or in_features
+        
+        self.gate = nn.Sequential(
+            nn.Linear(in_features, num_experts),
+            nn.Softmax(dim=-1)
+        )
+        
+        self.experts = nn.ModuleList([
+            ConvMlpExpert(
+                in_features=in_features,
+                hidden_features=hidden_features,
+                out_features=out_features,
+                act_layer=act_layer,
+                norm_layer=norm_layer,
+                bias=bias,
+                drop=drop,
+                expert_scale=num_experts
+            ) for _ in range(num_experts)
+        ])
+        
+        self.num_experts = num_experts
+        self.top_k = top_k
+        self.out_features = out_features
+
+    def forward(self, x):
+        # x shape: (batch, in_features, H, W)
+        batch_size, in_features, H, W = x.shape
+        
+        x_reshaped = x.permute(0, 2, 3, 1)  # (batch, H, W, in_features)
+        x_flattened = x_reshaped.reshape(-1, in_features)  # (batch*H*W, in_features)
+        
+        gate_scores = self.gate(x_flattened)  # (batch*H*W, num_experts)
+        
+        top_k_scores, top_k_indices = torch.topk(gate_scores, self.top_k, dim=-1)  # (batch*H*W, top_k)
+        top_k_scores = torch.softmax(top_k_scores, dim=-1)  
+        
+        output = torch.zeros((batch_size, self.out_features, H, W), device=x.device)
+        
+        for k in range(self.top_k):
+            expert_indices = top_k_indices[:, k]  # (batch*H*W,)
+            expert_weights = top_k_scores[:, k]  # (batch*H*W,)
+            
+            for i in range(self.num_experts):
+                mask = (expert_indices == i)  # (batch*H*W,)
+                if not mask.any():
+                    continue
+                    
+                expert_output = self.experts[i](x)  # (batch, out_features, H, W)
+                expert_weights_reshaped = expert_weights.reshape(batch_size, 1, H, W)  # (batch, 1, H, W)
+                output = output + expert_output * expert_weights_reshaped
+                
+        return output

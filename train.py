@@ -836,6 +836,7 @@ def main():
             f'Scheduled epochs: {num_epochs}. LR stepped per {"epoch" if lr_scheduler.t_in_epochs else "update"}.')
 
     results = []
+
     try:
         for epoch in range(start_epoch, num_epochs):
             if hasattr(dataset_train, 'set_epoch'):
@@ -1020,7 +1021,7 @@ def train_one_epoch(
                             mode=args.clip_mode,
                         )
                     optimizer.step()
-
+        import pdb;pdb.set_trace()
         if has_no_sync and not need_update:
             with model.no_sync():
                 loss = _forward()

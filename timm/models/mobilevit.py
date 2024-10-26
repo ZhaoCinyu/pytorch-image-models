@@ -20,7 +20,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from timm.layers import to_2tuple, make_divisible, GroupNorm1, ConvMlp, DropPath, is_exportable
+from timm.layers import to_2tuple, make_divisible, GroupNorm1, ConvMlp, DropPath, is_exportable, ConvMoE
 from ._builder import build_model_with_cfg
 from ._features_fx import register_notrace_module
 from ._registry import register_model, generate_default_cfgs, register_model_deprecations
@@ -51,7 +51,8 @@ def _mobilevit_block(d, c, s, transformer_dim, transformer_depth, patch_size=4, 
     )
 
 
-def _mobilevitv2_block(d, c, s, transformer_depth, patch_size=2, br=2.0, transformer_br=0.5):
+def _mobilevitv2_block(d, c, s, transformer_depth, patch_size=2, br=2.0, transformer_br=0.5,
+                       is_moe=False, num_experts=4, top_k=2):
     # inverted residual + mobilevit blocks as per MobileViT network
     return (
         _inverted_residual_block(d=d, c=c, s=s, br=br),
@@ -59,7 +60,10 @@ def _mobilevitv2_block(d, c, s, transformer_depth, patch_size=2, br=2.0, transfo
             type='mobilevit2', d=1, c=c, s=1, br=transformer_br, gs=1,
             block_kwargs=dict(
                 transformer_depth=transformer_depth,
-                patch_size=patch_size)
+                patch_size=patch_size,
+                is_moe=is_moe,
+                num_experts=num_experts,
+                top_k=top_k)
         )
     )
 
@@ -84,6 +88,25 @@ def _mobilevitv2_cfg(multiplier=1.0):
     )
     return cfg
 
+def _mobilevitv2moe_cfg(multiplier=1.0):
+    chs = (64, 128, 256, 384, 512)
+    if multiplier != 1.0:
+        chs = tuple([int(c * multiplier) for c in chs])
+    cfg = ByoModelCfg(
+        blocks=(
+            _inverted_residual_block(d=1, c=chs[0], s=1, br=2.0),
+            _inverted_residual_block(d=2, c=chs[1], s=2, br=2.0),
+            _mobilevitv2_block(d=1, c=chs[2], s=2, transformer_depth=2, is_moe=True, num_experts=4, top_k=2),
+            _mobilevitv2_block(d=1, c=chs[3], s=2, transformer_depth=4, is_moe=True, num_experts=4, top_k=2),
+            _mobilevitv2_block(d=1, c=chs[4], s=2, transformer_depth=3, is_moe=True, num_experts=4, top_k=2),
+        ),
+        stem_chs=int(32 * multiplier),
+        stem_type='3x3',
+        stem_pool='',
+        downsample='',
+        act_layer='silu',
+    )
+    return cfg
 
 model_cfgs = dict(
     mobilevit_xxs=ByoModelCfg(
@@ -158,6 +181,8 @@ model_cfgs = dict(
     mobilevitv2_150=_mobilevitv2_cfg(1.5),
     mobilevitv2_175=_mobilevitv2_cfg(1.75),
     mobilevitv2_200=_mobilevitv2_cfg(2.0),
+
+    mobilevitv2_100_moe=_mobilevitv2moe_cfg(1.0),
 )
 
 
@@ -446,6 +471,68 @@ class LinearTransformerBlock(nn.Module):
         return x
 
 
+class LinearMoETransformerBlock(nn.Module):
+    """
+    This class defines the pre-norm transformer encoder with linear self-attention in `MobileViTv2 paper <>`_
+    Args:
+        embed_dim (int): :math:`C_{in}` from an expected input of size :math:`(B, C_{in}, P, N)`
+        mlp_ratio (float): Inner dimension ratio of the FFN relative to embed_dim
+        drop (float): Dropout rate. Default: 0.0
+        attn_drop (float): Dropout rate for attention in multi-head attention. Default: 0.0
+        drop_path (float): Stochastic depth rate Default: 0.0
+        norm_layer (Callable): Normalization layer. Default: layer_norm_2d
+    Shape:
+        - Input: :math:`(B, C_{in}, P, N)` where :math:`B` is batch size, :math:`C_{in}` is input embedding dim,
+            :math:`P` is number of pixels in a patch, and :math:`N` is number of patches,
+        - Output: same shape as the input
+    """
+
+    def __init__(
+        self,
+        embed_dim: int,
+        mlp_ratio: float = 2.0,
+        drop: float = 0.0,
+        attn_drop: float = 0.0,
+        drop_path: float = 0.0,
+        act_layer=None,
+        norm_layer=None,
+        num_experts: int = 4,
+        top_k: int = 2,
+    ) -> None:
+        super().__init__()
+        act_layer = act_layer or nn.SiLU
+        norm_layer = norm_layer or GroupNorm1
+
+        self.norm1 = norm_layer(embed_dim)
+        self.attn = LinearSelfAttention(embed_dim=embed_dim, attn_drop=attn_drop, proj_drop=drop)
+        self.drop_path1 = DropPath(drop_path)
+
+        self.norm2 = norm_layer(embed_dim)
+        self.mlp = ConvMoE(
+            in_features=embed_dim,
+            hidden_features=int(embed_dim * mlp_ratio),
+            act_layer=act_layer,
+            drop=drop,
+            num_experts=num_experts,
+            top_k=top_k) 
+        self.drop_path2 = DropPath(drop_path)
+
+    def forward(self, x: torch.Tensor, x_prev: Optional[torch.Tensor] = None) -> torch.Tensor:
+        if x_prev is None:
+            # self-attention
+            x = x + self.drop_path1(self.attn(self.norm1(x)))
+        else:
+            # cross-attention
+            res = x
+            x = self.norm1(x)  # norm
+            x = self.attn(x, x_prev)  # attn
+            x = self.drop_path1(x) + res  # residual
+
+        # Feed forward network
+        x = x + self.drop_path2(self.mlp(self.norm2(x)))
+        return x
+    
+
 @register_notrace_module
 class MobileVitV2Block(nn.Module):
     """
@@ -469,6 +556,9 @@ class MobileVitV2Block(nn.Module):
         drop_path_rate: float = 0.,
         layers: LayerFn = None,
         transformer_norm_layer: Callable = GroupNorm1,
+        is_moe = False,
+        num_experts: int = 4,
+        top_k: int = 2,
         **kwargs,  # eat unused args
     ):
         super(MobileVitV2Block, self).__init__()
@@ -481,19 +571,35 @@ class MobileVitV2Block(nn.Module):
             in_chs, in_chs, kernel_size=kernel_size,
             stride=1, groups=groups, dilation=dilation[0])
         self.conv_1x1 = nn.Conv2d(in_chs, transformer_dim, kernel_size=1, bias=False)
-
-        self.transformer = nn.Sequential(*[
-            LinearTransformerBlock(
-                transformer_dim,
-                mlp_ratio=mlp_ratio,
-                attn_drop=attn_drop,
-                drop=drop,
-                drop_path=drop_path_rate,
-                act_layer=layers.act,
-                norm_layer=transformer_norm_layer
-            )
-            for _ in range(transformer_depth)
-        ])
+        
+        if is_moe:
+            self.transformer = nn.Sequential(*[
+                LinearMoETransformerBlock(
+                    transformer_dim,
+                    mlp_ratio=mlp_ratio,
+                    attn_drop=attn_drop,
+                    drop=drop,
+                    drop_path=drop_path_rate,
+                    act_layer=layers.act,
+                    norm_layer=transformer_norm_layer,
+                    num_experts=num_experts,
+                    top_k=top_k,
+                )
+                for _ in range(transformer_depth)
+            ])
+        else:
+            self.transformer = nn.Sequential(*[
+                LinearTransformerBlock(
+                    transformer_dim,
+                    mlp_ratio=mlp_ratio,
+                    attn_drop=attn_drop,
+                    drop=drop,
+                    drop_path=drop_path_rate,
+                    act_layer=layers.act,
+                    norm_layer=transformer_norm_layer
+                )
+                for _ in range(transformer_depth)
+            ])
         self.norm = transformer_norm_layer(transformer_dim)
 
         self.conv_proj = layers.conv_norm_act(transformer_dim, out_chs, kernel_size=1, stride=1, apply_act=False)
@@ -617,6 +723,10 @@ default_cfgs = generate_default_cfgs({
     'mobilevitv2_200.cvnets_in22k_ft_in1k_384': _cfg(
         hf_hub_id='timm/',
         input_size=(3, 384, 384), pool_size=(12, 12), crop_pct=1.0),
+
+    'mobilevitv2_100_moe.cvnets_in1k': _cfg(
+        hf_hub_id='timm/',
+        crop_pct=0.888),
 })
 
 
@@ -669,6 +779,9 @@ def mobilevitv2_175(pretrained=False, **kwargs) -> ByobNet:
 def mobilevitv2_200(pretrained=False, **kwargs) -> ByobNet:
     return _create_mobilevit('mobilevitv2_200', pretrained=pretrained, **kwargs)
 
+@register_model
+def mobilevitv2_100_moe(pretrained=False, **kwargs) -> ByobNet:
+    return _create_mobilevit('mobilevitv2_100_moe', pretrained=pretrained, **kwargs)
 
 register_model_deprecations(__name__, {
     'mobilevitv2_150_in22ft1k': 'mobilevitv2_150.cvnets_in22k_ft_in1k',
